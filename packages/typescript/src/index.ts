@@ -302,97 +302,113 @@ export async function fetchWithPayment(
   opts: PayOptions,
 ): Promise<Response> {
   const f = opts.fetchImpl ?? fetch;
-  const first = await f(input as RequestInfo, init);
-  const challenge = await parseChallenge(first);
-  if (!challenge) return first;
+  const request = new Request(input as RequestInfo, init);
+  const retry = request.clone();
+  let retryFetchCompleted = false;
+  const discardRetryBody = () => {
+    void retry.body?.cancel().catch(() => undefined);
+  };
 
-  const picked = selectOffer(challenge, opts.policy);
-  if (isRefusal(picked)) {
-    throw Object.assign(new Error(`x402: ${picked.refused}: ${picked.detail}`), picked);
-  }
-  if (picked.scheme !== "exact") {
-    throw new Error(
-      `x402: this client signs the 'exact' scheme; the offer asks for '${picked.scheme}', ` +
-        `which needs a transfer this library does not make`,
-    );
-  }
-  const extra = picked.extra;
-  if (!extra?.name || !extra?.version) {
-    throw new Error(
-      "x402: the offer carries no EIP-712 domain (extra.name/version); signing " +
-        "under a guessed one recovers a different address and is rejected as a bad signature",
-    );
-  }
-
-  const authorization = buildAuthorization(picked, opts.signer.address);
-  const signature = await opts.signer.signTransferWithAuthorization({
-    domain: {
-      name: extra.name,
-      version: extra.version,
-      chainId: chainIdFor(picked.network),
-      verifyingContract: picked.asset,
-    },
-    message: authorization,
-  });
-
-  const x402Version = challenge.x402Version ?? 1;
-  const header = encodePaymentHeader({
-    x402Version,
-    scheme: "exact",
-    network: picked.network,
-    payload: { signature, authorization },
-  });
-  const headers = new Headers(init?.headers);
-  headers.set("X-PAYMENT", header);
-  const paid = await f(input as RequestInfo, { ...init, headers });
-  const validate = opts.validatePaidOutput;
-  if (!validate || !paid.ok) return paid;
-
-  const attemptEvidence = buildPaymentAttemptEvidence({
-    x402Version,
-    network: picked.network,
-    offer: picked,
-    authorization,
-    signature,
-    paymentHeader: header,
-  });
-
-  let body: Uint8Array;
   try {
-    body = new Uint8Array(await paid.clone().arrayBuffer());
-  } catch {
-    throw new PaidOutputRejectedError(
-      "x402: paid response body is not readable",
-      paid,
+    const first = await f(request);
+    const challenge = await parseChallenge(first);
+    if (!challenge) {
+      discardRetryBody();
+      return first;
+    }
+
+    const picked = selectOffer(challenge, opts.policy);
+    if (isRefusal(picked)) {
+      throw Object.assign(new Error(`x402: ${picked.refused}: ${picked.detail}`), picked);
+    }
+    if (picked.scheme !== "exact") {
+      throw new Error(
+        `x402: this client signs the 'exact' scheme; the offer asks for '${picked.scheme}', ` +
+          `which needs a transfer this library does not make`,
+      );
+    }
+    const extra = picked.extra;
+    if (!extra?.name || !extra?.version) {
+      throw new Error(
+        "x402: the offer carries no EIP-712 domain (extra.name/version); signing " +
+          "under a guessed one recovers a different address and is rejected as a bad signature",
+      );
+    }
+
+    const authorization = buildAuthorization(picked, opts.signer.address);
+    const signature = await opts.signer.signTransferWithAuthorization({
+      domain: {
+        name: extra.name,
+        version: extra.version,
+        chainId: chainIdFor(picked.network),
+        verifyingContract: picked.asset,
+      },
+      message: authorization,
+    });
+
+    const x402Version = challenge.x402Version ?? 1;
+    const header = encodePaymentHeader({
+      x402Version,
+      scheme: "exact",
+      network: picked.network,
+      payload: { signature, authorization },
+    });
+    const headers = new Headers(retry.headers);
+    headers.set("X-PAYMENT", header);
+    const paid = await f(retry, { headers });
+    retryFetchCompleted = true;
+    const validate = opts.validatePaidOutput;
+    if (!validate || !paid.ok) return paid;
+
+    const attemptEvidence = buildPaymentAttemptEvidence({
+      x402Version,
+      network: picked.network,
+      offer: picked,
+      authorization,
+      signature,
+      paymentHeader: header,
+    });
+
+    let body: Uint8Array;
+    try {
+      body = new Uint8Array(await paid.clone().arrayBuffer());
+    } catch {
+      throw new PaidOutputRejectedError(
+        "x402: paid response body is not readable",
+        paid,
+        attemptEvidence,
+      );
+    }
+
+    const viewBody = body.slice();
+    const headerRecord: Record<string, string> = {};
+    paid.headers.forEach((value, key) => {
+      headerRecord[key] = value;
+    });
+    Object.freeze(headerRecord);
+
+    const view: PaidOutputView = Object.freeze({
+      status: paid.status,
+      headers: headerRecord,
+      body: viewBody,
       attemptEvidence,
-    );
-  }
+      text: () => new TextDecoder().decode(viewBody),
+      json: () => JSON.parse(new TextDecoder().decode(viewBody)),
+    });
 
-  const viewBody = body.slice();
-  const headerRecord: Record<string, string> = {};
-  paid.headers.forEach((value, key) => {
-    headerRecord[key] = value;
-  });
-  Object.freeze(headerRecord);
+    try {
+      await validate(view);
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "x402: paid application output rejected";
+      throw new PaidOutputRejectedError(message, paid, attemptEvidence);
+    }
 
-  const view: PaidOutputView = Object.freeze({
-    status: paid.status,
-    headers: headerRecord,
-    body: viewBody,
-    attemptEvidence,
-    text: () => new TextDecoder().decode(viewBody),
-    json: () => JSON.parse(new TextDecoder().decode(viewBody)),
-  });
-
-  try {
-    await validate(view);
+    return paid;
   } catch (err) {
-    const message =
-      err instanceof Error ? err.message : "x402: paid application output rejected";
-    throw new PaidOutputRejectedError(message, paid, attemptEvidence);
+    if (!retryFetchCompleted) discardRetryBody();
+    throw err;
   }
-
-  return paid;
 }
 
 /**

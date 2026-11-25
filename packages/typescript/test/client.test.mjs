@@ -18,6 +18,12 @@ const offer = (over = {}) => ({
   extra: { name: "USDC", version: "2" }, ...over,
 });
 
+const captureFetchCall = async (input, init) => {
+  const request = new Request(input, init);
+  const body = new Uint8Array(await request.arrayBuffer());
+  return { method: request.method, url: request.url, headers: request.headers, body };
+};
+
 test("a buyer without a policy pays nothing", () => {
   const r = selectOffer({ x402Version: 1, accepts: [offer()] }, {});
   assert.equal(r.refused, "no-policy");
@@ -103,6 +109,77 @@ test("the signer is handed the offer's own domain, not a configured one", async 
   const sent = JSON.parse(Buffer.from(res.headers.get("x-echo"), "base64").toString("utf8"));
   assert.equal(sent.payload.signature, "0xsig");
   assert.equal(sent.scheme, "exact");
+});
+
+test("the paid retry replays a Request body with its method and headers", async () => {
+  const challengeBody = { x402Version: 1, accepts: [offer()] };
+  const calls = [];
+  const fetchImpl = async (input, init) => {
+    calls.push(await captureFetchCall(input, init));
+    if (calls.length === 1) return new Response(JSON.stringify(challengeBody), { status: 402 });
+    return new Response("paid", { status: 200 });
+  };
+  const res = await fetchWithPayment(
+    new Request("https://x/y", {
+      method: "POST",
+      headers: { "x-custom": "custom-value" },
+      body: "request-body",
+    }),
+    undefined,
+    {
+      policy, fetchImpl,
+      signer: { address: "0xdeadbeef", signTransferWithAuthorization: async () => "0xsig" },
+    },
+  );
+  assert.equal(res.status, 200);
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.equal(call.method, "POST");
+    assert.equal(call.url, "https://x/y");
+    assert.equal(new TextDecoder().decode(call.body), "request-body");
+    assert.equal(call.headers.get("x-custom"), "custom-value");
+  }
+  assert.deepEqual(calls[1].body, calls[0].body);
+  assert.equal(calls[0].headers.get("x-payment"), null);
+  assert.ok(calls[1].headers.get("x-payment"));
+});
+
+test("the paid retry replays a ReadableStream init body", async () => {
+  const challengeBody = { x402Version: 1, accepts: [offer()] };
+  const chunk = new Uint8Array([0, 1, 2, 127, 255]);
+  const calls = [];
+  const fetchImpl = async (input, init) => {
+    calls.push(await captureFetchCall(input, init));
+    if (calls.length === 1) return new Response(JSON.stringify(challengeBody), { status: 402 });
+    return new Response("paid", { status: 200 });
+  };
+  const res = await fetchWithPayment(
+    "https://x/stream",
+    {
+      method: "POST",
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(chunk);
+          controller.close();
+        },
+      }),
+      duplex: "half",
+    },
+    {
+      policy, fetchImpl,
+      signer: { address: "0xdeadbeef", signTransferWithAuthorization: async () => "0xsig" },
+    },
+  );
+  assert.equal(res.status, 200);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].method, "POST");
+  assert.equal(calls[1].method, "POST");
+  assert.equal(calls[0].url, "https://x/stream");
+  assert.equal(calls[1].url, "https://x/stream");
+  assert.deepEqual(calls[0].body, chunk);
+  assert.deepEqual(calls[1].body, calls[0].body);
+  assert.equal(calls[0].headers.get("x-payment"), null);
+  assert.ok(calls[1].headers.get("x-payment"));
 });
 
 test("an unparseable amount is named as such, not silently over budget", () => {
